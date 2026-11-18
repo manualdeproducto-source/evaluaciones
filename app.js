@@ -9,7 +9,8 @@ const db = getFirestore(fb);
 const $app = document.getElementById("app"), $nav = document.getElementById("nav"), $user = document.getElementById("user");
 
 let user=null, isAdmin=false, exams=[], attempts=[];
-const S={view:"home",exam:null,answers:[],result:null,draft:null,msg:"",all:[]};
+const imgCache={};
+const S={view:"home",exam:null,answers:[],result:null,draft:null,msg:"",all:[],saving:false};
 
 function h(tag,a={},...kids){
   const e=document.createElement(tag);
@@ -19,11 +20,50 @@ function h(tag,a={},...kids){
     else if(["checked","disabled","value"].includes(k))e[k]=a[k];
     else e.setAttribute(k,a[k]);
   }
-  kids.forEach(c=>{if(c==null||c===false)return;e.appendChild(typeof c==="object"?c:document.createTextNode(String(c)));});
+  kids.flat().forEach(c=>{if(c==null||c===false)return;e.appendChild(typeof c==="object"?c:document.createTextNode(String(c)));});
   return e;
 }
 const go=v=>{S.view=v;S.msg="";render();window.scrollTo(0,0);};
 const fmt=ts=>new Date(ts).toLocaleString("es-AR");
+
+/* ---------- Imágenes ---------- */
+// Las opciones viejas eran texto simple; las nuevas son {text, img}
+const norm=o=>typeof o==="string"?{text:o,img:null}:{text:o.text||"",img:o.img||null};
+function collectIds(ex){
+  const s=new Set();
+  (ex&&ex.questions||[]).forEach(q=>{if(q.img)s.add(q.img);q.options.forEach(o=>{const n=norm(o);if(n.img)s.add(n.img);});});
+  return s;
+}
+async function preload(ex){
+  const ids=[...collectIds(ex)].filter(id=>!imgCache[id]);
+  await Promise.all(ids.map(async id=>{try{const d=await getDoc(doc(db,"images",id));if(d.exists())imgCache[id]=d.data().data;}catch(e){}}));
+}
+function compress(file){
+  return new Promise((res,rej)=>{
+    const r=new FileReader();
+    r.onerror=rej;
+    r.onload=()=>{
+      const i=new Image(); i.onerror=rej;
+      i.onload=()=>{
+        let max=900,q=.75,data;
+        for(let k=0;k<5;k++){
+          const s=Math.min(1,max/Math.max(i.width,i.height));
+          const c=document.createElement("canvas");
+          c.width=Math.max(1,Math.round(i.width*s)); c.height=Math.max(1,Math.round(i.height*s));
+          const x=c.getContext("2d"); x.fillStyle="#fff"; x.fillRect(0,0,c.width,c.height); x.drawImage(i,0,0,c.width,c.height);
+          data=c.toDataURL("image/jpeg",q);
+          if(data.length<350000)break;
+          max*=.75; q=Math.max(.4,q-.1);
+        }
+        res(data);
+      };
+      i.src=r.result;
+    };
+    r.readAsDataURL(file);
+  });
+}
+const imgSrc=img=>img?(img.data||imgCache[img.id]||""):"";
+const picEl=(id,cls="pic")=>id&&imgCache[id]?h("img",{class:cls,src:imgCache[id],alt:""}):null;
 
 /* ---------- Auth ---------- */
 onAuthStateChanged(auth, async u=>{
@@ -71,20 +111,38 @@ function rHome(){
       h("button",{class:"pri",onclick:()=>start(ex)},"Comenzar"))));
   });
 }
-function start(ex){S.exam=ex;S.answers=new Array(ex.questions.length).fill(null);go("take");}
+async function start(ex){
+  S.exam=ex;S.answers=new Array(ex.questions.length).fill(null);
+  $app.innerHTML="";$app.appendChild(h("p",{class:"mut"},"Cargando…"));
+  await preload(ex); go("take");
+}
+
+function optBlock(q,i,mode){
+  const pics=q.options.some(o=>norm(o).img);
+  const box=h("div",{class:"optgrid"+(pics?" pics":"")});
+  q.options.forEach((o,j)=>{
+    const n=norm(o);
+    if(mode==="take"){
+      box.appendChild(h("label",{class:"opt"},
+        h("input",{type:"radio",name:"q"+i,checked:S.answers[i]===j,onchange:()=>{S.answers[i]=j;S.upd();}}),
+        picEl(n.img),n.text?h("span",{},n.text):null));
+    }else{
+      const cls=j===q.correct?" ok":(j===S.answers[i]?" bad":"");
+      box.appendChild(h("label",{class:"opt"+cls},
+        (j===q.correct?"✓ ":j===S.answers[i]?"✗ ":null),picEl(n.img),n.text?h("span",{},n.text):null));
+    }
+  });
+  return box;
+}
+function qHead(q,i){return [h("p",{},h("strong",{},`${i+1}. ${q.text||""}`)),picEl(q.img,"pic qpic")];}
 
 function rTake(){
   const ex=S.exam;
   $app.appendChild(h("h2",{},ex.title));
-  ex.questions.forEach((q,i)=>{
-    const c=h("div",{class:"card"},h("p",{},h("strong",{},`${i+1}. ${q.text}`)));
-    q.options.forEach((o,j)=>c.appendChild(h("label",{class:"opt"},
-      h("input",{type:"radio",name:"q"+i,checked:S.answers[i]===j,onchange:()=>{S.answers[i]=j;upd();}}),o)));
-    $app.appendChild(c);
-  });
+  ex.questions.forEach((q,i)=>$app.appendChild(h("div",{class:"card"},...qHead(q,i),optBlock(q,i,"take"))));
   const btn=h("button",{class:"pri",onclick:finish},"Finalizar"), info=h("span",{class:"mut"});
-  const upd=()=>{const n=S.answers.filter(a=>a!==null).length;info.textContent=`${n} de ${ex.questions.length} respondidas`;btn.disabled=n<ex.questions.length;};
-  upd();
+  S.upd=()=>{const n=S.answers.filter(a=>a!==null).length;info.textContent=`${n} de ${ex.questions.length} respondidas`;btn.disabled=n<ex.questions.length;};
+  S.upd();
   $app.appendChild(h("div",{class:"row"},h("button",{onclick:()=>go("home")},"Cancelar"),info,btn));
 }
 
@@ -107,14 +165,7 @@ function rResult(){
     h("p",{class:"mut center"},`${r.correct} correctas de ${r.total}`),
     r.saved===true?h("p",{class:"mut center"},"✓ Guardado en tu historial"):null,
     r.saved===false?h("p",{class:"err center"},"No se pudo guardar el intento."):null));
-  ex.questions.forEach((q,i)=>{
-    const c=h("div",{class:"card"},h("p",{},h("strong",{},`${i+1}. ${q.text}`)));
-    q.options.forEach((o,j)=>{
-      const cls=j===q.correct?" ok":(j===S.answers[i]?" bad":"");
-      c.appendChild(h("label",{class:"opt"+cls},(j===q.correct?"✓ ":j===S.answers[i]?"✗ ":"")+o));
-    });
-    $app.appendChild(c);
-  });
+  ex.questions.forEach((q,i)=>$app.appendChild(h("div",{class:"card"},...qHead(q,i),optBlock(q,i,"result"))));
   $app.appendChild(h("div",{class:"row"},h("button",{onclick:()=>start(ex)},"Reintentar"),h("button",{class:"pri",onclick:()=>go("home")},"Volver")));
 }
 
@@ -129,18 +180,39 @@ function rHistory(){
 }
 
 /* ---------- Administración ---------- */
-const newExam=()=>{S.draft={id:null,title:"",questions:[{text:"",options:["",""],correct:0}]};go("edit");};
+const blankQ=()=>({text:"",img:null,options:[{text:"",img:null},{text:"",img:null}],correct:0});
+const newExam=()=>{S.draft={id:null,title:"",questions:[blankQ()]};go("edit");};
+const toDraft=ex=>({id:ex.id,title:ex.title,questions:ex.questions.map(q=>({
+  text:q.text||"",img:q.img?{id:q.img}:null,correct:q.correct,
+  options:q.options.map(o=>{const n=norm(o);return{text:n.text,img:n.img?{id:n.img}:null};})}))});
 
 function rAdmin(){
   $app.appendChild(h("div",{class:"row",style:"margin-bottom:12px"},h("h2",{},"Evaluaciones"),h("button",{class:"pri",onclick:newExam},"+ Nueva evaluación")));
   exams.forEach(ex=>$app.appendChild(h("div",{class:"card row"},
     h("div",{},h("strong",{},ex.title),h("div",{class:"mut"},`${ex.questions.length} preguntas`)),
-    h("div",{},h("button",{onclick:()=>{S.draft=JSON.parse(JSON.stringify(ex));go("edit");}},"Editar")," ",
+    h("div",{},h("button",{onclick:async()=>{await preload(ex);S.draft=toDraft(ex);go("edit");}},"Editar")," ",
       h("button",{class:"del",onclick:()=>delExam(ex)},"Eliminar")))));
 }
 async function delExam(ex){
   if(!confirm(`¿Eliminar “${ex.title}”?`))return;
-  try{await deleteDoc(doc(db,"exams",ex.id));await loadData();render();}catch(e){alert("No se pudo eliminar.");}
+  try{
+    await deleteDoc(doc(db,"exams",ex.id));
+    for(const id of collectIds(ex)){try{await deleteDoc(doc(db,"images",id));}catch(e){}}
+    await loadData();render();
+  }catch(e){alert("No se pudo eliminar.");}
+}
+
+// Botón de imagen + vista previa para una pregunta u opción ("holder" tiene .img)
+function imgControls(holder,label){
+  const fi=h("input",{type:"file",accept:"image/*",style:"display:none",onchange:async e=>{
+    const f=e.target.files[0]; if(!f)return;
+    try{holder.img={data:await compress(f)};render();}catch(x){alert("No se pudo leer la imagen.");}
+  }});
+  const src=imgSrc(holder.img);
+  const btn=h("button",{type:"button",title:"Imagen",onclick:()=>fi.click()},src?"🖼 Cambiar":label,fi);
+  const prev=src?h("div",{class:"prev"},h("img",{class:"thumb",src,alt:""}),
+    h("button",{type:"button",class:"del",onclick:()=>{holder.img=null;render();}},"Quitar imagen")):null;
+  return [btn,prev];
 }
 
 function rEdit(){
@@ -150,33 +222,56 @@ function rEdit(){
   d.questions.forEach((q,qi)=>{
     const c=h("div",{class:"card"},h("div",{class:"row"},h("strong",{},"Pregunta "+(qi+1)),
       d.questions.length>1?h("button",{class:"del",onclick:()=>{d.questions.splice(qi,1);render();}},"Quitar"):null));
-    c.appendChild(h("textarea",{rows:"2",placeholder:"Texto de la pregunta",oninput:e=>q.text=e.target.value},q.text));
-    c.appendChild(h("p",{class:"mut"},"Escribí las opciones y marcá la correcta:"));
-    q.options.forEach((o,oi)=>c.appendChild(h("div",{class:"opts"},
-      h("input",{type:"radio",name:"c"+qi,checked:q.correct===oi,onchange:()=>q.correct=oi}),
-      h("input",{type:"text",value:o,placeholder:"Opción "+(oi+1),oninput:e=>q.options[oi]=e.target.value}),
-      q.options.length>2?h("button",{class:"del",onclick:()=>{q.options.splice(oi,1);if(q.correct>=q.options.length)q.correct=0;else if(q.correct>oi)q.correct--;render();}},"✕"):null)));
-    if(q.options.length<6)c.appendChild(h("button",{onclick:()=>{q.options.push("");render();}},"+ Opción"));
+    c.appendChild(h("textarea",{rows:"2",placeholder:"Texto de la pregunta (opcional si ponés una imagen)",oninput:e=>q.text=e.target.value},q.text));
+    const [qb,qp]=imgControls(q,"📷 Imagen de la pregunta");
+    c.appendChild(h("div",{style:"margin:8px 0"},qb)); if(qp)c.appendChild(qp);
+    c.appendChild(h("p",{class:"mut"},"Opciones (texto, imagen o ambos). Marcá la correcta:"));
+    q.options.forEach((o,oi)=>{
+      const [ob,op]=imgControls(o,"📷");
+      c.appendChild(h("div",{class:"optedit"},
+        h("div",{class:"opts"},
+          h("input",{type:"radio",name:"c"+qi,checked:q.correct===oi,onchange:()=>q.correct=oi}),
+          h("input",{type:"text",value:o.text,placeholder:"Opción "+(oi+1),oninput:e=>o.text=e.target.value}),
+          ob,
+          q.options.length>2?h("button",{class:"del",onclick:()=>{q.options.splice(oi,1);if(q.correct>=q.options.length)q.correct=0;else if(q.correct>oi)q.correct--;render();}},"✕"):null),
+        op));
+    });
+    if(q.options.length<6)c.appendChild(h("button",{onclick:()=>{q.options.push({text:"",img:null});render();}},"+ Opción"));
     $app.appendChild(c);
   });
   $app.appendChild(h("div",{class:"row"},
-    h("button",{onclick:()=>{d.questions.push({text:"",options:["",""],correct:0});render();}},"+ Pregunta"),
-    h("span",{class:"err"},S.msg),
-    h("div",{},h("button",{onclick:()=>go("admin")},"Cancelar")," ",h("button",{class:"pri",onclick:saveExam},"Guardar"))));
+    h("button",{onclick:()=>{d.questions.push(blankQ());render();}},"+ Pregunta"),
+    h("span",{class:S.saving?"mut":"err"},S.msg),
+    h("div",{},h("button",{disabled:S.saving,onclick:()=>go("admin")},"Cancelar")," ",h("button",{class:"pri",disabled:S.saving,onclick:saveExam},"Guardar"))));
 }
+
 async function saveExam(){
   const d=S.draft; let err="";
   if(!d.title.trim())err="Falta el título.";
   d.questions.forEach((q,i)=>{if(err)return;
-    if(!q.text.trim())err=`La pregunta ${i+1} está vacía.`;
-    else if(q.options.some(o=>!o.trim()))err=`Completá todas las opciones de la pregunta ${i+1}.`;});
+    if(!q.text.trim()&&!q.img)err=`La pregunta ${i+1} necesita texto o imagen.`;
+    else if(q.options.some(o=>!o.text.trim()&&!o.img))err=`Cada opción de la pregunta ${i+1} necesita texto o imagen.`;});
   if(err){S.msg=err;render();return;}
-  const data={title:d.title.trim(),updated:Date.now(),
-    questions:d.questions.map(q=>({text:q.text.trim(),options:q.options.map(o=>o.trim()),correct:q.correct}))};
+  S.saving=true;S.msg="Guardando…";render();
+  const old=d.id?collectIds(exams.find(e=>e.id===d.id)):new Set();
   try{
+    const up=async img=>{
+      if(!img)return null; if(img.id)return img.id;
+      const r=await addDoc(collection(db,"images"),{data:img.data,ts:Date.now()});
+      imgCache[r.id]=img.data; return r.id;
+    };
+    const questions=[];
+    for(const q of d.questions){
+      const options=[];
+      for(const o of q.options)options.push({text:o.text.trim(),img:await up(o.img)});
+      questions.push({text:q.text.trim(),img:await up(q.img),options,correct:q.correct});
+    }
+    const data={title:d.title.trim(),updated:Date.now(),questions};
     if(d.id)await setDoc(doc(db,"exams",d.id),data);else await addDoc(collection(db,"exams"),data);
-    await loadData();go("admin");
-  }catch(e){S.msg="No se pudo guardar (¿sos administrador?).";render();}
+    const keep=collectIds(data);
+    for(const id of old)if(!keep.has(id)){try{await deleteDoc(doc(db,"images",id));}catch(e){}}
+    await loadData();S.saving=false;go("admin");
+  }catch(e){S.saving=false;S.msg="No se pudo guardar (¿sos administrador? ¿actualizaste las reglas?).";render();}
 }
 
 async function rResults(){
