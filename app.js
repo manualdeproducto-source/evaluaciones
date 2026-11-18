@@ -23,7 +23,20 @@ function h(tag,a={},...kids){
   kids.flat().forEach(c=>{if(c==null||c===false)return;e.appendChild(typeof c==="object"?c:document.createTextNode(String(c)));});
   return e;
 }
-const go=v=>{S.view=v;S.msg="";render();window.scrollTo(0,0);};
+const go=v=>{
+  S.view=v;S.msg="";
+  if(v==="home"&&location.hash)history.replaceState(null,"",location.pathname+location.search);
+  render();window.scrollTo(0,0);
+};
+// Enlace directo: https://.../#e=ID_DE_LA_EVALUACION
+function route(){
+  const m=location.hash.match(/^#e=([A-Za-z0-9]+)$/);
+  S.msg="";
+  if(m){S.exam=exams.find(e=>e.id===m[1])||null;S.view="intro";}
+  else S.view="home";
+  render();window.scrollTo(0,0);
+}
+window.addEventListener("hashchange",()=>{if(user&&S.view!=="take")route();});
 const fmt=ts=>new Date(ts).toLocaleString("es-AR");
 
 /* ---------- Imágenes ---------- */
@@ -72,7 +85,7 @@ onAuthStateChanged(auth, async u=>{
     try{isAdmin=(await getDoc(doc(db,"admins",u.email))).exists();}catch(e){}
     await loadData();
   }
-  S.view="home"; render();
+  route();
 });
 async function login(){
   try{await signInWithPopup(auth,new GoogleAuthProvider());}
@@ -81,9 +94,14 @@ async function login(){
 async function loadData(){
   const ex=await getDocs(collection(db,"exams"));
   exams=ex.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>a.title.localeCompare(b.title));
+  await refreshAttempts();
+}
+async function refreshAttempts(){
   const at=await getDocs(query(collection(db,"attempts"),where("uid","==",user.uid)));
   attempts=at.docs.map(d=>d.data()).sort((a,b)=>b.ts-a.ts);
 }
+const used=ex=>attempts.filter(a=>a.examId===ex.id).length;
+const canTake=ex=>isAdmin||!ex.maxAttempts||used(ex)<ex.maxAttempts;
 
 /* ---------- Render ---------- */
 function render(){
@@ -98,22 +116,39 @@ function render(){
   const items=[["home","Evaluaciones"],["history","Mi historial"]];
   if(isAdmin)items.push(["admin","Administrar"],["results","Resultados"]);
   items.forEach(([v,t])=>$nav.appendChild(h("button",{class:(S.view===v||(v==="admin"&&S.view==="edit"))?"on":"",onclick:()=>go(v)},t)));
-  ({home:rHome,take:rTake,result:rResult,history:rHistory,admin:rAdmin,edit:rEdit,results:rResults})[S.view]();
+  ({home:rHome,take:rTake,result:rResult,history:rHistory,admin:rAdmin,edit:rEdit,results:rResults,intro:rIntro})[S.view]();
 }
 
+function examCard(ex){
+  const mine=attempts.filter(a=>a.examId===ex.id);
+  const best=mine.length?Math.max(...mine.map(a=>a.pct)):null;
+  const meta=[`${ex.questions.length} preguntas`,
+    ex.maxAttempts?`Intentos: ${mine.length} de ${ex.maxAttempts}`:null,
+    best!==null?`mejor resultado: ${best}%`:null].filter(Boolean).join(" · ");
+  const ok=canTake(ex);
+  return h("div",{class:"card"},h("div",{class:"row"},
+    h("div",{},h("h2",{},ex.title," ",ex.unlisted&&isAdmin?h("span",{class:"tag"},"Solo por enlace"):null),
+      h("div",{class:"mut"},meta),
+      isAdmin&&ex.maxAttempts?h("div",{class:"mut"},"Como administrador no tenés límite de intentos."):null,
+      ok?null:h("div",{class:"err"},"Ya usaste todos tus intentos.")),
+    h("button",{class:"pri",disabled:!ok,onclick:()=>start(ex)},"Comenzar")));
+}
 function rHome(){
-  if(!exams.length){$app.appendChild(h("div",{class:"card"},h("p",{},"Todavía no hay evaluaciones."),isAdmin?h("button",{class:"pri",onclick:newExam},"Crear la primera"):null));return;}
-  exams.forEach(ex=>{
-    const mine=attempts.filter(a=>a.examId===ex.id);
-    const best=mine.length?Math.max(...mine.map(a=>a.pct)):null;
-    $app.appendChild(h("div",{class:"card"},h("div",{class:"row"},
-      h("div",{},h("h2",{},ex.title),h("div",{class:"mut"},`${ex.questions.length} preguntas`+(best!==null?` · mejor resultado: ${best}%`:""))),
-      h("button",{class:"pri",onclick:()=>start(ex)},"Comenzar"))));
-  });
+  const list=exams.filter(ex=>!ex.unlisted||isAdmin);
+  if(!list.length){$app.appendChild(h("div",{class:"card"},h("p",{},"Todavía no hay evaluaciones."),isAdmin?h("button",{class:"pri",onclick:newExam},"Crear la primera"):null));return;}
+  list.forEach(ex=>$app.appendChild(examCard(ex)));
+}
+function rIntro(){
+  const ex=S.exam;
+  if(!ex){$app.appendChild(h("div",{class:"card center"},h("p",{},"No se encontró esa evaluación. Puede que haya sido eliminada."),h("button",{class:"pri",onclick:()=>go("home")},"Ver todas las evaluaciones")));return;}
+  $app.appendChild(examCard(ex));
+  $app.appendChild(h("p",{class:"center"},h("button",{onclick:()=>go("home")},"Ver todas las evaluaciones")));
 }
 async function start(ex){
-  S.exam=ex;S.answers=new Array(ex.questions.length).fill(null);
   $app.innerHTML="";$app.appendChild(h("p",{class:"mut"},"Cargando…"));
+  try{await refreshAttempts();}catch(e){}
+  if(!canTake(ex)){alert("Ya usaste todos los intentos de esta evaluación.");render();return;}
+  S.exam=ex;S.answers=new Array(ex.questions.length).fill(null);
   await preload(ex); go("take");
 }
 
@@ -166,7 +201,7 @@ function rResult(){
     r.saved===true?h("p",{class:"mut center"},"✓ Guardado en tu historial"):null,
     r.saved===false?h("p",{class:"err center"},"No se pudo guardar el intento."):null));
   ex.questions.forEach((q,i)=>$app.appendChild(h("div",{class:"card"},...qHead(q,i),optBlock(q,i,"result"))));
-  $app.appendChild(h("div",{class:"row"},h("button",{onclick:()=>start(ex)},"Reintentar"),h("button",{class:"pri",onclick:()=>go("home")},"Volver")));
+  $app.appendChild(h("div",{class:"row"},h("button",{disabled:!canTake(ex),onclick:()=>start(ex)},canTake(ex)?"Reintentar":"Sin intentos disponibles"),h("button",{class:"pri",onclick:()=>go("home")},"Volver")));
 }
 
 function rHistory(){
@@ -181,17 +216,27 @@ function rHistory(){
 
 /* ---------- Administración ---------- */
 const blankQ=()=>({text:"",img:null,options:[{text:"",img:null},{text:"",img:null}],correct:0});
-const newExam=()=>{S.draft={id:null,title:"",questions:[blankQ()]};go("edit");};
-const toDraft=ex=>({id:ex.id,title:ex.title,questions:ex.questions.map(q=>({
+const newExam=()=>{S.draft={id:null,title:"",max:"",unlisted:false,questions:[blankQ()]};go("edit");};
+const toDraft=ex=>({id:ex.id,title:ex.title,max:ex.maxAttempts?String(ex.maxAttempts):"",unlisted:!!ex.unlisted,questions:ex.questions.map(q=>({
   text:q.text||"",img:q.img?{id:q.img}:null,correct:q.correct,
   options:q.options.map(o=>{const n=norm(o);return{text:n.text,img:n.img?{id:n.img}:null};})}))});
 
 function rAdmin(){
   $app.appendChild(h("div",{class:"row",style:"margin-bottom:12px"},h("h2",{},"Evaluaciones"),h("button",{class:"pri",onclick:newExam},"+ Nueva evaluación")));
-  exams.forEach(ex=>$app.appendChild(h("div",{class:"card row"},
-    h("div",{},h("strong",{},ex.title),h("div",{class:"mut"},`${ex.questions.length} preguntas`)),
-    h("div",{},h("button",{onclick:async()=>{await preload(ex);S.draft=toDraft(ex);go("edit");}},"Editar")," ",
-      h("button",{class:"del",onclick:()=>delExam(ex)},"Eliminar")))));
+  exams.forEach(ex=>{
+    const cb=h("button",{onclick:()=>copyLink(ex,cb)},"🔗 Copiar enlace");
+    const info=[`${ex.questions.length} preguntas`,ex.maxAttempts?`${ex.maxAttempts} intento(s) por persona`:"intentos ilimitados",ex.unlisted?"solo por enlace":null].filter(Boolean).join(" · ");
+    $app.appendChild(h("div",{class:"card"},h("div",{class:"row"},
+      h("div",{},h("strong",{},ex.title),h("div",{class:"mut"},info)),
+      h("div",{},cb," ",
+        h("button",{onclick:async()=>{await preload(ex);S.draft=toDraft(ex);go("edit");}},"Editar")," ",
+        h("button",{class:"del",onclick:()=>delExam(ex)},"Eliminar")))));
+  });
+}
+async function copyLink(ex,btn){
+  const url=location.origin+location.pathname+"#e="+ex.id;
+  try{await navigator.clipboard.writeText(url);btn.textContent="¡Copiado!";setTimeout(()=>btn.textContent="🔗 Copiar enlace",1800);}
+  catch(e){prompt("Copiá este enlace:",url);}
 }
 async function delExam(ex){
   if(!confirm(`¿Eliminar “${ex.title}”?`))return;
@@ -219,6 +264,11 @@ function rEdit(){
   const d=S.draft;
   $app.appendChild(h("div",{class:"card"},h("strong",{},"Título de la evaluación"),
     h("input",{type:"text",value:d.title,placeholder:"Ej.: Matemática – Unidad 1",oninput:e=>d.title=e.target.value})));
+  $app.appendChild(h("div",{class:"card"},h("strong",{},"Configuración"),
+    h("p",{class:"mut",style:"margin:6px 0"},"Intentos permitidos por persona (vacío = ilimitados):"),
+    h("input",{type:"text",inputmode:"numeric",value:d.max,placeholder:"Ilimitados",style:"max-width:160px",oninput:e=>{e.target.value=e.target.value.replace(/\D/g,"");d.max=e.target.value;}}),
+    h("label",{style:"display:flex;gap:10px;align-items:center;margin-top:12px;cursor:pointer"},
+      h("input",{type:"checkbox",checked:d.unlisted,onchange:e=>d.unlisted=e.target.checked}),"Solo por enlace (no aparece en la lista)")));
   d.questions.forEach((q,qi)=>{
     const c=h("div",{class:"card"},h("div",{class:"row"},h("strong",{},"Pregunta "+(qi+1)),
       d.questions.length>1?h("button",{class:"del",onclick:()=>{d.questions.splice(qi,1);render();}},"Quitar"):null));
@@ -266,7 +316,7 @@ async function saveExam(){
       for(const o of q.options)options.push({text:o.text.trim(),img:await up(o.img)});
       questions.push({text:q.text.trim(),img:await up(q.img),options,correct:q.correct});
     }
-    const data={title:d.title.trim(),updated:Date.now(),questions};
+    const data={title:d.title.trim(),updated:Date.now(),maxAttempts:parseInt(d.max,10)||0,unlisted:!!d.unlisted,questions};
     if(d.id)await setDoc(doc(db,"exams",d.id),data);else await addDoc(collection(db,"exams"),data);
     const keep=collectIds(data);
     for(const id of old)if(!keep.has(id)){try{await deleteDoc(doc(db,"images",id));}catch(e){}}
